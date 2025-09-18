@@ -35,10 +35,15 @@ AudioControlSGTL5000 audioShield;
 
 // Control variables
 unsigned long lastTriggerTime[5] = {0};
-const int retriggerDelay = 250;  // Minimum ms between same drum (increased!)
+// Different retrigger delays for each drum type
+const int retriggerDelays[5] = {100, 80, 40, 120, 200}; // kick, snare, hihat, ride, crash
+// Different level thresholds for each drum type  
+const float drumThresholds[5] = {0.04, 0.03, 0.02, 0.025, 0.035}; // kick needs stronger hit
 float lastPeakLevel = 0;
 bool noteIsRinging = false;
 unsigned long noteStartTime = 0;
+// Store base gain levels for velocity scaling
+const float baseGains[5] = {0.5, 0.5, 0.3, 0.3, 0.5};
 
 void setup() {
   Serial.begin(115200);
@@ -96,11 +101,22 @@ void loop() {
     float probability = notefreq.probability();
     float level = peak.read();
     
+    // Determine which drum this frequency maps to
+    int drumType = -1;
+    if (freq >= 60 && freq < 110) drumType = 0;      // Kick
+    else if (freq >= 110 && freq < 165) drumType = 1; // Snare
+    else if (freq >= 165 && freq < 260) drumType = 2; // Hihat
+    else if (freq >= 260 && freq < 400) drumType = 3; // Ride
+    else if (freq >= 400) drumType = 4;               // Crash
+    
     // Detect NEW note attacks only (not sustained notes)
     bool isNewAttack = false;
     
-    // If signal is stronger than before, it's likely a new pluck
-    if (level > lastPeakLevel * 1.5 && level > 0.03) {
+    // Use drum-specific threshold for attack detection
+    float attackThreshold = (drumType >= 0) ? drumThresholds[drumType] : 0.03;
+    
+    // If signal is stronger than before AND exceeds drum-specific threshold
+    if (level > lastPeakLevel * 1.5 && level > attackThreshold) {
       isNewAttack = true;
       noteIsRinging = true;
       noteStartTime = millis();
@@ -112,58 +128,78 @@ void loop() {
     }
     
     // Only trigger on NEW attacks with good confidence
-    if (isNewAttack && probability > 0.7) {
-      triggerDrumForFrequency(freq);
+    if (isNewAttack && probability > 0.7 && drumType >= 0) {
+      triggerDrumForFrequency(freq, level);
     }
     
     lastPeakLevel = level;
   }
 }
 
-void triggerDrumForFrequency(float freq) {
+void triggerDrumForFrequency(float freq, float velocity) {
+  // Calculate velocity multiplier (0.3 to 1.0 range)
+  float velocityMultiplier = map(velocity * 100, 2, 20, 30, 100) / 100.0;
+  velocityMultiplier = constrain(velocityMultiplier, 0.3, 1.0);
+  
   // KICK DRUM (60-110 Hz) - Low E string area
   if (freq >= 60 && freq < 110) {
     if (canRetrigger(0)) {
+      // Apply velocity to mixer gain before triggering
+      drumMixer.gain(0, baseGains[0] * velocityMultiplier);
       drumKick.noteOn();
       Serial.print("🥁 KICK! ");
       Serial.print(freq, 1);
-      Serial.println(" Hz");
+      Serial.print(" Hz [vel:");
+      Serial.print(velocityMultiplier * 100, 0);
+      Serial.println("%]");
     }
   }
   // SNARE DRUM (110-165 Hz) - A string area
   else if (freq >= 110 && freq < 165) {
     if (canRetrigger(1)) {
+      drumMixer.gain(1, baseGains[1] * velocityMultiplier);
       drumSnare.noteOn();
       Serial.print("🪘 SNARE! ");
       Serial.print(freq, 1);
-      Serial.println(" Hz");
+      Serial.print(" Hz [vel:");
+      Serial.print(velocityMultiplier * 100, 0);
+      Serial.println("%]");
     }
   }
   // HI-HAT (165-260 Hz) - D & G string area
   else if (freq >= 165 && freq < 260) {
     if (canRetrigger(2)) {
+      drumMixer.gain(2, baseGains[2] * velocityMultiplier);
       drumHihat.noteOn();
       Serial.print("🎩 HAT! ");
       Serial.print(freq, 1);
-      Serial.println(" Hz");
+      Serial.print(" Hz [vel:");
+      Serial.print(velocityMultiplier * 100, 0);
+      Serial.println("%]");
     }
   }
   // RIDE CYMBAL (260-400 Hz) - B string area
   else if (freq >= 260 && freq < 400) {
     if (canRetrigger(3)) {
+      drumMixer.gain(3, baseGains[3] * velocityMultiplier);
       drumRide.noteOn();
       Serial.print("🔔 RIDE! ");
       Serial.print(freq, 1);
-      Serial.println(" Hz");
+      Serial.print(" Hz [vel:");
+      Serial.print(velocityMultiplier * 100, 0);
+      Serial.println("%]");
     }
   }
   // CRASH CYMBAL (400+ Hz) - High E string upper frets
   else if (freq >= 400) {
     if (canRetrigger(4)) {
+      mainMixer.gain(2, 0.5 * velocityMultiplier); // Crash on separate channel
       drumCrash.noteOn();
       Serial.print("💥 CRASH! ");
       Serial.print(freq, 1);
-      Serial.println(" Hz");
+      Serial.print(" Hz [vel:");
+      Serial.print(velocityMultiplier * 100, 0);
+      Serial.println("%]");
     }
   }
 }
@@ -201,8 +237,8 @@ void setupDrumSounds() {
 }
 
 bool canRetrigger(int drumIndex) {
-  // Prevent retriggering the same drum too quickly
-  if (millis() - lastTriggerTime[drumIndex] > retriggerDelay) {
+  // Use drum-specific retrigger delay
+  if (millis() - lastTriggerTime[drumIndex] > retriggerDelays[drumIndex]) {
     lastTriggerTime[drumIndex] = millis();
     return true;
   }
