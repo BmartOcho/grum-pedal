@@ -1,19 +1,41 @@
+// GUITAR DRUM TRIGGER - ADVANCED ONSET DETECTION VERSION
+// Combines your working drum synthesis with advanced onset detection
+
 #include <Audio.h>
 #include <Wire.h>
 #include <SPI.h>
-#include <SD.h>
-#include <SerialFlash.h>
-#include <ResponsiveAnalogRead.h>
 
-// Your existing audio setup - keeping it exactly as you have it
-AudioInputI2S            audioInput;
-AudioAnalyzeFFT256       fft;
-AudioAnalyzePeak         peak;
-AudioFilterBiquad        highpass;
-AudioConnection          patchCord1(audioInput, 0, highpass, 0);
-AudioConnection          patchCord2(highpass, 0, fft, 0);
-AudioConnection          patchCord3(highpass, 0, peak, 0);
-AudioControlSGTL5000     audioShield;
+// Audio signal flow - YOUR EXACT SETUP
+AudioInputI2S             audioInput;      // Guitar input
+AudioSynthSimpleDrum      drumKick;        // Kick drum sound
+AudioSynthSimpleDrum      drumSnare;       // Snare drum sound  
+AudioSynthSimpleDrum      drumHihat;       // Hi-hat sound
+AudioSynthSimpleDrum      drumRide;        // Ride sound
+AudioSynthSimpleDrum      drumCrash;       // Crash sound
+AudioMixer4               drumMixer;       // Mix all drums
+AudioMixer4               mainMixer;       // Mix drums + guitar
+AudioOutputI2S            audioOutput;     // Output to amp
+
+// Analysis objects for detection
+AudioAnalyzeFFT256        fft;             // For frequency and onset detection
+AudioAnalyzePeak          peak;            // Peak detection
+AudioFilterBiquad         highpass;        // Remove DC offset
+
+// Audio connections - keeping your exact output routing!
+AudioConnection patchCord1(audioInput, 0, highpass, 0);
+AudioConnection patchCord2(highpass, 0, fft, 0);
+AudioConnection patchCord3(highpass, 0, peak, 0);
+AudioConnection patchCord4(audioInput, 0, mainMixer, 0);  // Dry guitar
+AudioConnection patchCord5(drumKick, 0, drumMixer, 0);
+AudioConnection patchCord6(drumSnare, 0, drumMixer, 1);
+AudioConnection patchCord7(drumHihat, 0, drumMixer, 2);
+AudioConnection patchCord8(drumRide, 0, drumMixer, 3);
+AudioConnection patchCord9(drumCrash, 0, mainMixer, 2);   // Crash direct
+AudioConnection patchCord10(drumMixer, 0, mainMixer, 1);   // All drums
+AudioConnection patchCord11(mainMixer, 0, audioOutput, 0); // Left out
+AudioConnection patchCord12(mainMixer, 0, audioOutput, 1); // Right out
+
+AudioControlSGTL5000 audioShield;
 
 // Advanced onset detection variables
 const int ENERGY_HISTORY_SIZE = 8;
@@ -22,359 +44,323 @@ int energyHistoryIndex = 0;
 float lastEnergy = 0;
 float fftData[128];  // Store FFT data for reuse
 
-// Your existing variables
-float noteFreqs[16] = {
-    82.41, 87.31, 92.50, 98.00, 103.83, 110.00, 116.54, 123.47,
-    130.81, 138.59, 146.83, 155.56, 164.81, 174.61, 185.00, 196.00
-};
-int noteSamples[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+// Control variables - your existing ones
+unsigned long lastTriggerTime[5] = {0};
+const int retriggerDelay = 80;  // Minimum ms between same drum
 float lastPeakLevel = 0;
-unsigned long lastTriggerTime = 0;
-const unsigned int RETRIGGER_TIME = 50;
-bool noteActive = false;
-int lastTriggeredNote = -1;
 
-// New adaptive threshold variables
-float adaptiveThreshold = 0.01;
-float noiseFloor = 0.001;
-float THRESHOLD_MULTIPLIER = 2.0;  // Lowered for better sensitivity
-float HFC_THRESHOLD = 1.2;         // Lowered for better sensitivity
-float ENERGY_RATIO_THRESHOLD = 1.5; // Lowered for better sensitivity
+// Onset detection thresholds - MADE MORE SENSITIVE
+float adaptiveThreshold = 0.001;     // Lowered from 0.01
+float noiseFloor = 0.0001;           // Much lower noise floor
+float THRESHOLD_MULTIPLIER = 1.2;    // Lower = more sensitive (was 1.8)
+float HFC_THRESHOLD = 0.8;           // Lower HFC requirement (was 1.0)
+float ENERGY_RATIO_THRESHOLD = 1.2;  // Lower ratio needed (was 1.5)
 
 void setup() {
-    Serial.begin(115200);
-    delay(1000);  // Give serial time to initialize
-    
-    AudioMemory(12);
-    
-    audioShield.enable();
-    audioShield.inputSelect(AUDIO_INPUT_LINEIN);
-    audioShield.lineInLevel(5);  // Increased sensitivity (0-15, where 5 is default)
-    audioShield.volume(0.5);
-    
-    // Configure high-pass filter to remove DC and low frequency noise
-    highpass.setHighpass(0, 40, 0.7);  // 40 Hz cutoff
-    
-    // Initialize energy history with small values to avoid division by zero
-    for (int i = 0; i < ENERGY_HISTORY_SIZE; i++) {
-        energyHistory[i] = 0.001;
-    }
-    
-    Serial.println("Hybrid Guitar/Bass Trigger Ready");
-    Serial.println("Waiting for input...");
+  Serial.begin(115200);
+  delay(500);
+  
+  Serial.println("====================================");
+  Serial.println("  GUITAR DRUMS - ADVANCED TRIGGER  ");
+  Serial.println("====================================");
+  Serial.println("Initializing...");
+  
+  // Audio setup - keeping your exact configuration
+  AudioMemory(50);
+  audioShield.enable();
+  audioShield.inputSelect(AUDIO_INPUT_LINEIN);
+  audioShield.lineInLevel(10);     // INCREASED from 0 to 10 for more sensitivity
+  audioShield.micGain(40);         // Boost for guitar
+  audioShield.volume(0.7);         // Output volume
+  
+  // Configure high-pass filter
+  highpass.setHighpass(0, 40, 0.7);
+  
+  // Initialize energy history
+  for (int i = 0; i < ENERGY_HISTORY_SIZE; i++) {
+    energyHistory[i] = 0.001;
+  }
+  
+  // Configure drum sounds - YOUR EXACT SETTINGS
+  setupDrumSounds();
+  
+  // Setup mixer levels - YOUR EXACT LEVELS
+  drumMixer.gain(0, 0.7);   // Kick volume
+  drumMixer.gain(1, 0.7);   // Snare volume
+  drumMixer.gain(2, 0.5);   // Hihat volume
+  drumMixer.gain(3, 0.5);   // Ride volume
+  
+  mainMixer.gain(0, 0);     // Dry guitar volume (0%)
+  mainMixer.gain(1, 0.8);   // Drums volume
+  mainMixer.gain(2, 0.6);   // Crash volume
+  
+  // Play startup drum sequence
+  delay(500);
+  Serial.println("Playing test drums...");
+  drumKick.noteOn();
+  delay(200);
+  drumSnare.noteOn();
+  delay(200);
+  drumHihat.noteOn();
+  delay(200);
+  drumCrash.noteOn();
+  delay(500);
+  
+  Serial.println("\n♪ Ready! Play your guitar! ♪");
+  Serial.println("====================================\n");
 }
 
-// Calculate current frame energy from stored FFT data
+// Calculate energy from FFT data
 float calculateEnergy() {
-    float energy = 0;
-    
-    // Use stored FFT data
-    for (int i = 0; i < 128; i++) {
-        energy += fftData[i] * fftData[i];
-    }
-    energy = sqrt(energy / 128.0);
-    
-    return energy;
+  float energy = 0;
+  for (int i = 0; i < 128; i++) {
+    energy += fftData[i] * fftData[i];
+  }
+  energy = sqrt(energy / 128.0);
+  return energy;
 }
 
-// Calculate High Frequency Content (HFC) from stored FFT data
+// Calculate High Frequency Content for pluck detection
 float calculateHFC() {
-    float hfc = 0;
-    
-    // Weight higher frequency bins more heavily
-    for (int i = 64; i < 128; i++) {  // Upper half of spectrum
-        float weight = (float)i / 128.0;  // Linear weighting
-        hfc += fftData[i] * fftData[i] * weight;
-    }
-    hfc = sqrt(hfc / 64.0);
-    
-    return hfc;
+  float hfc = 0;
+  for (int i = 64; i < 128; i++) {
+    float weight = (float)i / 128.0;
+    hfc += fftData[i] * fftData[i] * weight;
+  }
+  hfc = sqrt(hfc / 64.0);
+  return hfc;
 }
 
-// Update energy history and calculate average
+// Update energy history
 float updateEnergyHistory(float currentEnergy) {
-    energyHistory[energyHistoryIndex] = currentEnergy;
-    energyHistoryIndex = (energyHistoryIndex + 1) % ENERGY_HISTORY_SIZE;
-    
-    // Calculate average of history
-    float avgHistory = 0;
-    for (int i = 0; i < ENERGY_HISTORY_SIZE; i++) {
-        avgHistory += energyHistory[i];
-    }
-    avgHistory /= ENERGY_HISTORY_SIZE;
-    
-    return avgHistory;
+  energyHistory[energyHistoryIndex] = currentEnergy;
+  energyHistoryIndex = (energyHistoryIndex + 1) % ENERGY_HISTORY_SIZE;
+  
+  float avgHistory = 0;
+  for (int i = 0; i < ENERGY_HISTORY_SIZE; i++) {
+    avgHistory += energyHistory[i];
+  }
+  avgHistory /= ENERGY_HISTORY_SIZE;
+  return avgHistory;
 }
 
 // Advanced onset detection
 bool detectOnset(float level, float &velocity) {
-    // First check if level is above noise floor
-    if (level < noiseFloor) {
-        return false;
+  if (level < noiseFloor) return false;
+  
+  float currentEnergy = calculateEnergy();
+  if (currentEnergy < 0.001) currentEnergy = level;
+  
+  float hfc = calculateHFC();
+  float avgHistory = updateEnergyHistory(currentEnergy);
+  adaptiveThreshold = avgHistory * THRESHOLD_MULTIPLIER + noiseFloor;
+  
+  float energyRatio = currentEnergy / (avgHistory + 0.001);
+  float hfcRatio = hfc / (avgHistory + 0.001);
+  
+  // Check all conditions
+  bool energyCondition = currentEnergy > adaptiveThreshold;
+  bool ratioCondition = energyRatio > ENERGY_RATIO_THRESHOLD;
+  bool hfcCondition = hfcRatio > HFC_THRESHOLD || hfc > 0.01;
+  bool risingEdge = currentEnergy > lastEnergy * 1.2;
+  
+  bool isOnset = false;
+  if (energyCondition && ratioCondition && risingEdge) {
+    if (hfcCondition || currentEnergy > adaptiveThreshold * 3) {
+      isOnset = true;
+      velocity = constrain(currentEnergy * 2.0, 0.0, 1.0);
     }
-    
-    // Calculate current energy from FFT data
-    float currentEnergy = calculateEnergy();
-    
-    // If no FFT energy, fall back to peak level
-    if (currentEnergy < 0.001) {
-        currentEnergy = level;
-    }
-    
-    // Calculate HFC for pluck detection
-    float hfc = calculateHFC();
-    
-    // Update history and get average
-    float avgHistory = updateEnergyHistory(currentEnergy);
-    
-    // Update adaptive threshold
-    adaptiveThreshold = avgHistory * THRESHOLD_MULTIPLIER + noiseFloor;
-    
-    // Calculate energy increase ratio
-    float energyRatio = currentEnergy / (avgHistory + 0.001);  // Avoid division by zero
-    
-    // Calculate HFC ratio
-    float hfcRatio = hfc / (avgHistory + 0.001);
-    
-    // Check retrigger time first to avoid unnecessary processing
-    if ((millis() - lastTriggerTime) < RETRIGGER_TIME) {
-        lastEnergy = currentEnergy;
-        return false;
-    }
-    
-    // Multi-factor onset detection
-    bool isOnset = false;
-    
-    // Check all conditions for onset - with some conditions being optional
-    bool energyCondition = currentEnergy > adaptiveThreshold;
-    bool ratioCondition = energyRatio > ENERGY_RATIO_THRESHOLD;
-    bool hfcCondition = hfcRatio > HFC_THRESHOLD || hfc > 0.01;  // More lenient HFC
-    bool risingEdge = currentEnergy > lastEnergy * 1.2;  // Lowered from 1.3
-    
-    // Combine conditions - make HFC optional for very strong signals
-    if (energyCondition && ratioCondition && risingEdge) {
-        if (hfcCondition || currentEnergy > adaptiveThreshold * 3) {  // Strong signal bypasses HFC
-            isOnset = true;
-            
-            // Calculate velocity based on energy
-            velocity = currentEnergy * 2.0;
-            velocity = constrain(velocity, 0.0, 1.0);
-            
-            // Debug output
-            Serial.print("ONSET! Energy: ");
-            Serial.print(currentEnergy, 4);
-            Serial.print(" Ratio: ");
-            Serial.print(energyRatio, 2);
-            Serial.print(" HFC: ");
-            Serial.print(hfcRatio, 2);
-            Serial.print(" Velocity: ");
-            Serial.println(velocity, 2);
-        }
-    }
-    
-    lastEnergy = currentEnergy;
-    return isOnset;
+  }
+  
+  lastEnergy = currentEnergy;
+  return isOnset;
 }
 
-// Your existing pitch detection using stored FFT data
+// Detect pitch from FFT data
 float detectPitch() {
-    float maxLevel = 0;
-    int maxBin = 0;
-    
-    // Find the peak frequency bin
-    for (int i = 2; i < 128; i++) {  // Skip DC and very low frequencies
-        if (fftData[i] > maxLevel) {
-            maxLevel = fftData[i];
-            maxBin = i;
-        }
+  float maxLevel = 0;
+  int maxBin = 0;
+  
+  for (int i = 2; i < 128; i++) {
+    if (fftData[i] > maxLevel) {
+      maxLevel = fftData[i];
+      maxBin = i;
     }
-    
-    // Need minimum signal strength
-    if (maxLevel < 0.01) return -1;
-    
-    // Parabolic interpolation for more accurate frequency
-    if (maxBin > 0 && maxBin < 127) {
-        float y1 = fftData[maxBin - 1];
-        float y2 = fftData[maxBin];
-        float y3 = fftData[maxBin + 1];
-        
-        if (y2 > y1 && y2 > y3) {  // Ensure we have a peak
-            float x0 = (y3 - y1) / (2 * (2 * y2 - y1 - y3));
-            float interpolatedBin = maxBin + x0;
-            
-            // Convert bin to frequency (44100 Hz sample rate, 256 point FFT)
-            float frequency = interpolatedBin * 44100.0 / 256.0;
-            return frequency;
-        }
-    }
-    
-    // Fallback to simple calculation
-    float frequency = maxBin * 44100.0 / 256.0;
-    return frequency;
+  }
+  
+  if (maxLevel < 0.01) return -1;
+  
+  // Simple frequency calculation
+  float frequency = maxBin * 44100.0 / 256.0;
+  return frequency;
 }
 
-// Find closest note to detected frequency
-int findClosestNote(float frequency) {
-    if (frequency < 0) return -1;
-    
-    int closestNote = -1;
-    float minDifference = 1000;
-    
-    for (int i = 0; i < 16; i++) {
-        float difference = abs(frequency - noteFreqs[i]);
-        float cents = 1200 * log2(frequency / noteFreqs[i]);
-        
-        // Check if within ±50 cents (quarter tone)
-        if (abs(cents) < 50 && difference < minDifference) {
-            minDifference = difference;
-            closestNote = i;
-        }
+// YOUR EXACT DRUM TRIGGERING FUNCTION - with velocity support via mixer
+void triggerDrumForFrequency(float freq, float velocity) {
+  // Adjust drum velocity based on input velocity
+  float drumGain = velocity * 0.8 + 0.2;  // Scale velocity (0.2 to 1.0)
+  
+  // KICK DRUM (60-110 Hz) - Low E string area
+  if (freq >= 60 && freq < 110) {
+    if (canRetrigger(0)) {
+      drumMixer.gain(0, 0.7 * drumGain);  // Adjust kick volume by velocity
+      drumKick.noteOn();  // Trigger drum (no parameter)
+      Serial.print("🥁 KICK! ");
+      Serial.print(freq, 1);
+      Serial.print(" Hz, Vel: ");
+      Serial.println(velocity, 2);
     }
-    
-    return closestNote;
+  }
+  // SNARE DRUM (110-165 Hz) - A string area
+  else if (freq >= 110 && freq < 165) {
+    if (canRetrigger(1)) {
+      drumMixer.gain(1, 0.7 * drumGain);  // Adjust snare volume by velocity
+      drumSnare.noteOn();
+      Serial.print("🪘 SNARE! ");
+      Serial.print(freq, 1);
+      Serial.print(" Hz, Vel: ");
+      Serial.println(velocity, 2);
+    }
+  }
+  // HI-HAT (165-260 Hz) - D & G string area
+  else if (freq >= 165 && freq < 260) {
+    if (canRetrigger(2)) {
+      drumMixer.gain(2, 0.5 * drumGain);  // Adjust hihat volume by velocity
+      drumHihat.noteOn();
+      Serial.print("🎩 HAT! ");
+      Serial.print(freq, 1);
+      Serial.print(" Hz, Vel: ");
+      Serial.println(velocity, 2);
+    }
+  }
+  // RIDE CYMBAL (260-400 Hz) - B string area
+  else if (freq >= 260 && freq < 400) {
+    if (canRetrigger(3)) {
+      drumMixer.gain(3, 0.5 * drumGain);  // Adjust ride volume by velocity
+      drumRide.noteOn();
+      Serial.print("🔔 RIDE! ");
+      Serial.print(freq, 1);
+      Serial.print(" Hz, Vel: ");
+      Serial.println(velocity, 2);
+    }
+  }
+  // CRASH CYMBAL (400+ Hz) - High E string upper frets
+  else if (freq >= 400) {
+    if (canRetrigger(4)) {
+      mainMixer.gain(2, 0.6 * drumGain);  // Adjust crash volume by velocity (on main mixer)
+      drumCrash.noteOn();
+      Serial.print("💥 CRASH! ");
+      Serial.print(freq, 1);
+      Serial.print(" Hz, Vel: ");
+      Serial.println(velocity, 2);
+    }
+  }
 }
 
-// Trigger sample with velocity
-void triggerSample(int noteIndex, float velocity) {
-    if (noteIndex < 0 || noteIndex >= 16) return;
-    
-    int sampleNumber = noteSamples[noteIndex];
-    int velocityMIDI = (int)(velocity * 127);
-    
-    Serial.print("TRIGGER Note: ");
-    Serial.print(noteIndex);
-    Serial.print(" Sample: ");
-    Serial.print(sampleNumber);
-    Serial.print(" Freq: ");
-    Serial.print(noteFreqs[noteIndex]);
-    Serial.print(" Hz, Velocity: ");
-    Serial.println(velocityMIDI);
-    
-    // Add your sample triggering code here
-    // playSample(sampleNumber, velocity);
-    // or
-    // sendMIDI(noteToMIDI[noteIndex], velocityMIDI);
-    
-    lastTriggeredNote = noteIndex;
-    noteActive = true;
+// YOUR EXACT DRUM SOUND SETUP
+void setupDrumSounds() {
+  // KICK - Deep and punchy (60Hz fundamental)
+  drumKick.frequency(60);
+  drumKick.length(150);
+  drumKick.secondMix(0.0);
+  drumKick.pitchMod(0.5);
+  
+  // SNARE - Snappy with noise (200Hz + noise)
+  drumSnare.frequency(200);
+  drumSnare.length(100);
+  drumSnare.secondMix(1.0);
+  drumSnare.pitchMod(0.2);
+  
+  // HI-HAT - Short and crisp (800Hz)
+  drumHihat.frequency(800);
+  drumHihat.length(40);
+  drumHihat.secondMix(1.0);
+  drumHihat.pitchMod(0.0);
+  
+  // RIDE - Metallic ring (500Hz)
+  drumRide.frequency(500);
+  drumRide.length(300);
+  drumRide.secondMix(0.5);
+  drumRide.pitchMod(0.1);
+  
+  // CRASH - Long and bright (900Hz)
+  drumCrash.frequency(900);
+  drumCrash.length(500);
+  drumCrash.secondMix(1.0);
+  drumCrash.pitchMod(0.0);
 }
 
-// Note off detection (optional)
-void checkNoteOff(float level) {
-    if (noteActive && level < lastPeakLevel * 0.1) {
-        noteActive = false;
-        Serial.print("Note OFF: ");
-        Serial.println(lastTriggeredNote);
-        
-        // Add your note-off handling here
-        // stopSample(lastTriggeredNote);
-        // or
-        // sendMIDINoteOff(noteToMIDI[lastTriggeredNote]);
-    }
+// YOUR EXACT RETRIGGER FUNCTION
+bool canRetrigger(int drumIndex) {
+  if (millis() - lastTriggerTime[drumIndex] > retriggerDelay) {
+    lastTriggerTime[drumIndex] = millis();
+    return true;
+  }
+  return false;
 }
 
 void loop() {
-    // Check if we have both FFT and peak data available
-    if (fft.available() && peak.available()) {
-        // Read FFT data ONCE and store it
-        for (int i = 0; i < 128; i++) {
-            fftData[i] = fft.read(i);
-        }
-        
-        // Read peak level
-        float level = peak.read();
-        
-        // For debugging - show we're getting signal
-        static int loopCounter = 0;
-        loopCounter++;
-        if (loopCounter % 100 == 0) {  // Every 100 loops
-            if (level > 0.001) {
-                Serial.print("Signal detected - Level: ");
-                Serial.print(level, 4);
-                Serial.print(" Energy: ");
-                Serial.println(calculateEnergy(), 4);
-            }
-        }
-        
-        // Advanced onset detection with velocity
-        float velocity = 0;
-        bool onsetDetected = detectOnset(level, velocity);
-        
-        if (onsetDetected) {
-            // Detect pitch using stored FFT data
-            float frequency = detectPitch();
-            
-            Serial.print("Frequency detected: ");
-            Serial.println(frequency);
-            
-            if (frequency > 0) {
-                // Find closest note
-                int noteIndex = findClosestNote(frequency);
-                
-                if (noteIndex >= 0) {
-                    // Adjust velocity based on detected frequency
-                    // Lower notes get a boost since they naturally have less HF content
-                    if (frequency < 100) {
-                        velocity *= 1.2;
-                    } else if (frequency > 300) {
-                        velocity *= 0.9;
-                    }
-                    velocity = constrain(velocity, 0.0, 1.0);
-                    
-                    // Trigger the sample
-                    triggerSample(noteIndex, velocity);
-                    lastTriggerTime = millis();
-                    lastPeakLevel = level;
-                } else {
-                    Serial.println("Note not in range");
-                }
-            }
-        }
-        
-        // Check for note off
-        checkNoteOff(level);
+  // NEW: Advanced onset detection replacing notefreq
+  if (fft.available() && peak.available()) {
+    // Read FFT data once
+    for (int i = 0; i < 128; i++) {
+      fftData[i] = fft.read(i);
     }
     
-    // Also handle case where only peak is available (fallback)
-    else if (peak.available()) {
-        float level = peak.read();
-        
-        // Simple fallback detection for when FFT isn't ready
-        if (level > lastPeakLevel * 1.5 && 
-            level > 0.01 && 
-            (millis() - lastTriggerTime) > RETRIGGER_TIME) {
-            
-            Serial.println("Fallback trigger (FFT not available)");
-            lastPeakLevel = level;
-            lastTriggerTime = millis();
-        }
+    // Read peak level
+    float level = peak.read();
+    
+    // Debug: Show actual signal levels
+    static int debugCounter = 0;
+    debugCounter++;
+    if (debugCounter % 50 == 0) {  // Every 50 loops
+      if (level > 0.0001) {  // Very low threshold for any signal
+        Serial.print("Level: ");
+        Serial.print(level, 5);
+        Serial.print(" Energy: ");
+        Serial.print(calculateEnergy(), 5);
+        Serial.print(" Threshold: ");
+        Serial.println(adaptiveThreshold, 5);
+      } else {
+        Serial.print(".");  // No signal dot
+      }
     }
+    
+    // Check for onset with velocity
+    float velocity = 0;
+    bool onsetDetected = detectOnset(level, velocity);
+    
+    if (onsetDetected) {
+      // Detect pitch from FFT
+      float freq = detectPitch();
+      
+      Serial.print("Onset detected! Freq: ");
+      Serial.println(freq);
+      
+      if (freq > 50 && freq < 1000) {  // Valid frequency range
+        // Trigger the appropriate drum with velocity
+        triggerDrumForFrequency(freq, velocity);
+      }
+    }
+  }
+  
+  // Simple peak test - bypass onset detection for testing
+  static unsigned long lastSimpleTrigger = 0;
+  if (peak.available()) {
+    float level = peak.read();
+    // Very simple trigger just to test if we're getting audio
+    if (level > 0.01 && (millis() - lastSimpleTrigger > 100)) {
+      Serial.print("SIMPLE TRIGGER! Level: ");
+      Serial.println(level, 4);
+      drumKick.noteOn();  // Test kick drum
+      lastSimpleTrigger = millis();
+    }
+  }
 }
 
-// Optional: Function to adjust sensitivity
+// Optional: Adjust sensitivity on the fly
 void adjustSensitivity(float newMultiplier) {
-    // Allow dynamic adjustment of threshold multiplier
-    // Lower = more sensitive, Higher = less sensitive
-    // Typical range: 1.5 (very sensitive) to 4.0 (less sensitive)
-    THRESHOLD_MULTIPLIER = constrain(newMultiplier, 1.0, 4.0);
-    
-    Serial.print("Sensitivity adjusted to: ");
-    Serial.println(THRESHOLD_MULTIPLIER);
-}
-
-// Optional: Function to switch between bass and guitar modes
-void setInstrumentMode(bool isBass) {
-    if (isBass) {
-        // Bass mode - adjust parameters for lower frequencies
-        highpass.setHighpass(0, 30, 0.7);  // Lower cutoff
-        noiseFloor = 0.002;  // Higher noise floor for stronger signal
-        THRESHOLD_MULTIPLIER = 2.2;  // Slightly higher threshold
-        Serial.println("Mode set to: BASS");
-    } else {
-        // Guitar mode
-        highpass.setHighpass(0, 40, 0.7);  // Standard cutoff
-        noiseFloor = 0.001;
-        THRESHOLD_MULTIPLIER = 2.0;
-        Serial.println("Mode set to: GUITAR");
-    }
+  THRESHOLD_MULTIPLIER = constrain(newMultiplier, 1.0, 3.0);
+  Serial.print("Sensitivity adjusted to: ");
+  Serial.println(THRESHOLD_MULTIPLIER);
 }
