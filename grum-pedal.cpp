@@ -44,6 +44,12 @@ int energyHistoryIndex = 0;
 float lastEnergy = 0;
 float fftData[128];  // Store FFT data for reuse
 
+// Add these variables for improved pitch detection
+float pitchHistory[3] = {0};  // Store last 3 pitch detections
+int pitchHistoryIndex = 0;
+float zcrBuffer[128];  // Buffer for zero-crossing rate calculation
+int zcrBufferIndex = 0;
+
 // Control variables - your existing ones
 unsigned long lastTriggerTime[5] = {0};
 const int retriggerDelay = 80;  // Minimum ms between same drum
@@ -73,8 +79,8 @@ void setup() {
   audioShield.micGain(40);         // Boost for guitar
   audioShield.volume(0.7);         // Output volume
   
-  // Configure high-pass filter
-  highpass.setHighpass(0, 40, 0.7);
+  // Configure high-pass filter - ADJUSTED for better bass response
+  highpass.setHighpass(0, 30, 0.5);  // Lowered to 30Hz, less resonance
   
   // Initialize energy history
   for (int i = 0; i < ENERGY_HISTORY_SIZE; i++) {
@@ -299,8 +305,142 @@ bool canRetrigger(int drumIndex) {
   return false;
 }
 
+// Zero-crossing rate calculation for frequency validation
+float calculateZCR(float* buffer, int length) {
+  int crossings = 0;
+  for (int i = 1; i < length; i++) {
+    // Count zero crossings
+    if ((buffer[i-1] >= 0 && buffer[i] < 0) || 
+        (buffer[i-1] < 0 && buffer[i] >= 0)) {
+      crossings++;
+    }
+  }
+  // Convert to frequency estimate (crossings per sample * sample rate / 2)
+  float zcrFreq = (crossings * 44100.0) / (length * 2.0);
+  return zcrFreq;
+}
+
+// Find harmonic peaks in FFT data
+bool findHarmonicPeaks(int* peaks, float* levels, int maxPeaks) {
+  // Find local maxima in FFT data
+  int peakCount = 0;
+  
+  for (int i = 1; i < 30 && peakCount < maxPeaks; i++) {
+    // Check if this bin is a local maximum
+    if (i < 127 && fftData[i] > fftData[i-1] && 
+        fftData[i] > fftData[i+1] && 
+        fftData[i] > 0.002) {
+      peaks[peakCount] = i;
+      levels[peakCount] = fftData[i];
+      peakCount++;
+    }
+  }
+  
+  return peakCount > 0;
+}
+
+// Detect pitch with harmonic analysis and validation
+float detectPitchWithHarmonics() {
+  int peaks[8];
+  float levels[8];
+  
+  // Find peaks in spectrum
+  if (!findHarmonicPeaks(peaks, levels, 8)) {
+    return -1;  // No significant peaks
+  }
+  
+  // Find fundamental by looking for harmonic relationships
+  float bestFundamental = -1;
+  float bestScore = 0;
+  
+  // Test each peak as potential fundamental
+  for (int f = 0; f < 3; f++) {  // Check first 3 peaks
+    if (peaks[f] == 0) continue;
+    
+    float fundamental = peaks[f] * 172.27;  // Convert bin to Hz
+    float score = levels[f];  // Start with peak strength
+    
+    // Look for harmonics of this fundamental
+    for (int h = 2; h <= 4; h++) {  // Check 2nd, 3rd, 4th harmonics
+      int harmonicBin = peaks[f] * h;
+      if (harmonicBin < 30) {
+        // Check if there's energy at the harmonic
+        float harmonicEnergy = fftData[harmonicBin];
+        if (harmonicBin > 0 && harmonicBin < 128) {
+          // Also check neighboring bins (not perfect tuning)
+          harmonicEnergy = max(harmonicEnergy, fftData[harmonicBin-1]);
+          if (harmonicBin < 127) {
+            harmonicEnergy = max(harmonicEnergy, fftData[harmonicBin+1]);
+          }
+        }
+        
+        // Add to score if harmonic is present
+        if (harmonicEnergy > 0.001) {
+          score += harmonicEnergy * (1.0 / h);  // Weight lower harmonics more
+        }
+      }
+    }
+    
+    // Update best if this is better
+    if (score > bestScore && fundamental >= 60 && fundamental <= 800) {
+      bestScore = score;
+      bestFundamental = fundamental;
+    }
+  }
+  
+  return bestFundamental;
+}
+
+// Multi-frame pitch averaging for stability
+float getStablePitch() {
+  float currentPitch = detectPitchWithHarmonics();
+  
+  // Store in history
+  pitchHistory[pitchHistoryIndex] = currentPitch;
+  pitchHistoryIndex = (pitchHistoryIndex + 1) % 3;
+  
+  // Check if we have consistent pitch over multiple frames
+  int validCount = 0;
+  float avgPitch = 0;
+  
+  for (int i = 0; i < 3; i++) {
+    if (pitchHistory[i] > 0) {
+      validCount++;
+      avgPitch += pitchHistory[i];
+    }
+  }
+  
+  if (validCount < 2) {
+    return -1;  // Need at least 2 valid readings
+  }
+  
+  avgPitch /= validCount;
+  
+  // Check that all valid readings are within 10% of average
+  for (int i = 0; i < 3; i++) {
+    if (pitchHistory[i] > 0) {
+      float deviation = abs(pitchHistory[i] - avgPitch) / avgPitch;
+      if (deviation > 0.1) {  // More than 10% deviation
+        return -1;  // Pitch not stable
+      }
+    }
+  }
+  
+  // Debug output
+  static int debugCount = 0;
+  if (++debugCount % 5 == 0 && avgPitch > 0) {
+    Serial.print("Stable pitch: ");
+    Serial.print(avgPitch);
+    Serial.print(" Hz (");
+    Serial.print(validCount);
+    Serial.println(" frames)");
+  }
+  
+  return avgPitch;
+}
+
 void loop() {
-  // NEW: Advanced onset detection replacing notefreq
+  // NEW: Advanced onset detection with improved pitch detection
   if (fft.available() && peak.available()) {
     // Read FFT data once
     for (int i = 0; i < 128; i++) {
@@ -310,51 +450,82 @@ void loop() {
     // Read peak level
     float level = peak.read();
     
-    // Debug: Show actual signal levels
-    static int debugCounter = 0;
-    debugCounter++;
-    if (debugCounter % 50 == 0) {  // Every 50 loops
-      if (level > 0.0001) {  // Very low threshold for any signal
-        Serial.print("Level: ");
-        Serial.print(level, 5);
-        Serial.print(" Energy: ");
-        Serial.print(calculateEnergy(), 5);
-        Serial.print(" Threshold: ");
-        Serial.println(adaptiveThreshold, 5);
-      } else {
-        Serial.print(".");  // No signal dot
-      }
-    }
-    
     // Check for onset with velocity
     float velocity = 0;
     bool onsetDetected = detectOnset(level, velocity);
     
     if (onsetDetected) {
-      // Detect pitch from FFT
-      float freq = detectPitch();
+      // Use multi-frame averaged pitch detection with harmonic analysis
+      float freq = getStablePitch();
       
-      Serial.print("Onset detected! Freq: ");
-      Serial.println(freq);
-      
-      if (freq > 50 && freq < 1000) {  // Valid frequency range
+      if (freq > 0) {  // Valid, stable frequency detected
         // Trigger the appropriate drum with velocity
         triggerDrumForFrequency(freq, velocity);
+      } else {
+        // Improved fallback using harmonic content analysis
+        // Look for presence of harmonics to determine drum type
+        float fundamental = detectPitchWithHarmonics();
+        
+        if (fundamental > 0) {
+          // Got a fundamental but not stable over time
+          Serial.print("Unstable pitch: ");
+          Serial.print(fundamental);
+          Serial.println(" Hz - using best guess");
+          triggerDrumForFrequency(fundamental, velocity);
+        } else {
+          // No clear pitch - use energy distribution
+          float lowEnergy = 0;   // Bins 1-3 (80-250 Hz)
+          float midEnergy = 0;   // Bins 4-8 (250-500 Hz)
+          float highEnergy = 0;  // Bins 9+ (500+ Hz)
+          
+          for (int i = 1; i <= 3; i++) lowEnergy += fftData[i];
+          for (int i = 4; i <= 8; i++) midEnergy += fftData[i];
+          for (int i = 9; i <= 20; i++) highEnergy += fftData[i];
+          
+          // Only show fallback if we have significant energy
+          if (lowEnergy + midEnergy + highEnergy > 0.01) {
+            Serial.print("Energy fallback - L:");
+            Serial.print(lowEnergy, 3);
+            Serial.print(" M:");
+            Serial.print(midEnergy, 3);
+            Serial.print(" H:");
+            Serial.println(highEnergy, 3);
+            
+            // Trigger based on energy distribution
+            if (lowEnergy > midEnergy * 1.5 && lowEnergy > highEnergy * 1.5) {
+              drumMixer.gain(0, 0.7 * velocity);
+              drumKick.noteOn();
+              Serial.println("→ KICK");
+            } else if (midEnergy > highEnergy * 1.2) {
+              drumMixer.gain(1, 0.7 * velocity);
+              drumSnare.noteOn();
+              Serial.println("→ SNARE");
+            } else {
+              drumMixer.gain(2, 0.5 * velocity);
+              drumHihat.noteOn();
+              Serial.println("→ HAT");
+            }
+          }
+        }
       }
     }
   }
   
-  // Simple peak test - bypass onset detection for testing
-  static unsigned long lastSimpleTrigger = 0;
-  if (peak.available()) {
-    float level = peak.read();
-    // Very simple trigger just to test if we're getting audio
-    if (level > 0.01 && (millis() - lastSimpleTrigger > 100)) {
-      Serial.print("SIMPLE TRIGGER! Level: ");
-      Serial.println(level, 4);
-      drumKick.noteOn();  // Test kick drum
-      lastSimpleTrigger = millis();
+  // Status indicator
+  static unsigned long lastStatusTime = 0;
+  static int dotCount = 0;
+  if (millis() - lastStatusTime > 100) {
+    if (peak.available()) {
+      float level = peak.read();
+      if (level > 0.001) {
+        dotCount++;
+        if (dotCount >= 10) {
+          Serial.print("♪");
+          dotCount = 0;
+        }
+      }
     }
+    lastStatusTime = millis();
   }
 }
 
