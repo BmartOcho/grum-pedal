@@ -12,13 +12,14 @@ AudioAnalyzePeak          peak;       // time-domain peak for onset + velocity
 AudioSynthSimpleDrum      kick, snare, hat, ride, crash;
 AudioMixer4               drumMix, mainMix;
 AudioOutputI2S            out1;
-AudioSynthWaveform  beep;
-AudioConnection     patchBeep(beep, 0, mainMix, 0);
+AudioSynthWaveform        beep;
 
-AudioConnection patchCord1(in1, 0, hpf, 0);
+AudioMixer4 inMix;
+
+
+AudioConnection patchInHPF(inMix, 0, hpf, 0);  // summed -> HPF -> YIN/Peak
 AudioConnection patchCord2(hpf, 0, yin, 0);
 AudioConnection patchCord3(hpf, 0, peak, 0);
-
 AudioConnection patchCord4(kick,  0, drumMix, 0);
 AudioConnection patchCord5(snare, 0, drumMix, 1);
 AudioConnection patchCord6(hat,   0, drumMix, 2);
@@ -26,17 +27,19 @@ AudioConnection patchCord7(ride,  0, drumMix, 3);
 AudioConnection patchCord8(drumMix, 0, mainMix, 1);
 AudioConnection patchCord9(mainMix, 0, out1, 0);
 AudioConnection patchCord10(mainMix, 0, out1, 1);
-AudioConnection patchCord11(in1, 0, mainMix, 0);   // dry guitar -> main mix ch0
+AudioConnection patchInL(in1, 0, inMix, 0);  // left
+AudioConnection patchInR(in1, 1, inMix, 1); // right
+AudioConnection patchDry(inMix, 0, mainMix, 0);  //  summed dry -> main mix ch0 
 
 AudioControlSGTL5000 sgtl;
 
 // ---------- Config ----------
 const uint16_t AUDIO_MEM = 60;
-const uint8_t  LINE_IN_LEVEL = 14;     // adjust 8..15 to taste
+const uint8_t  LINE_IN_LEVEL = 15;     // adjust 8..15 to taste
 const float    HPF_HZ = 30.0f;
 
 // YIN confidence
-const float    YIN_CONF = 0.82f;       // 0.80..0.90
+const float    YIN_CONF = 0.80f;       // 0.80..0.90
 
 // Debounce/hysteresis
 const uint32_t RETRIGGER_MS = 90;
@@ -44,19 +47,19 @@ const float    HYST_PCT = 0.06f;       // ±6% around band edges
 
 // Onset parameters
 const float    EMA_ALPHA = 0.05f;      // 0.03..0.10 (smoothing). Larger = quicker adaptation
-const float    THRESH_MULT = 1.6f;     // 1.4..2.2 (sensitivity). Lower = more sensitive
-const float    NOISE_FLOOR = 0.003f;   // small floor so idle noise doesn’t trigger
+const float    THRESH_MULT = 1.5f;     // 1.4..2.2 (sensitivity). Lower = more sensitive
+const float    NOISE_FLOOR = 0.0025f;   // small floor so idle noise doesn’t trigger
 const uint32_t ONSET_MIN_GAP_MS = 70;  // global onset guard (in addition to per-drum debounce)
 
 // Bands for standard tuning
 struct Band { float fmin, fmax; uint8_t idx; };
 Band bands[] = {
-  {  74.0f,  92.0f, 0 }, // E2  -> Kick
-  { 100.0f, 122.0f, 1 }, // A2  -> Snare
-  { 135.0f, 160.0f, 2 }, // D3  -> Hat
-  { 185.0f, 210.0f, 2 }, // G3  -> Hat
-  { 235.0f, 260.0f, 3 }, // B3  -> Ride
-  { 315.0f, 350.0f, 4 }, // E4  -> Crash
+  {  0.0f,  100.0f, 0 }, // -> Kick
+  { 110.0f, 200.0f, 1 }, //  -> Snare
+  { 210.0f, 300.0f, 2 }, //  -> Hat
+  { 310.0f, 400.0f, 2 }, //  -> Hat
+  { 410.0f, 500.0f, 3 }, //  -> Ride
+  { 510.0f, 600.0f, 4 }, //  -> Crash
 };
 
 // State
@@ -109,7 +112,7 @@ void setupDrums() {
   drumMix.gain(0,0.7f); drumMix.gain(1,0.7f);
   drumMix.gain(2,0.5f); drumMix.gain(3,0.5f);
 
-  mainMix.gain(0, 0.25f); // dry muted for now
+  mainMix.gain(0, 0.0f); // dry muted for now
   mainMix.gain(1, 0.8f); // drums bus
   mainMix.gain(2, 0.6f); // crash direct
 }
@@ -136,7 +139,13 @@ void setup() {
   sgtl.inputSelect(AUDIO_INPUT_LINEIN);
   sgtl.lineInLevel(LINE_IN_LEVEL);
   sgtl.volume(0.80f);
-  sgtl.unmuteHeadphone();      // belt-and-suspenders: ensure HP out is enabled
+  sgtl.unmuteHeadphone(); // belt-and-suspenders: ensure HP out is enabled
+  
+  inMix.gain(0, 0.5f);  // L
+  inMix.gain(1, 0.5f);  // R
+  inMix.gain(2, 0.0f);
+  inMix.gain(3, 0.0f);
+
 
   hpf.setHighpass(0, HPF_HZ, 0.707f);
   yin.begin(0.15f);  // stable pitch
@@ -185,10 +194,11 @@ void loop() {
   }
 
   // Heartbeat/memory every ~500ms
-  static uint32_t t0=0;
-  if (millis() - t0 > 500) {
-    Serial.printf("♪ mem now %u / %u (max %u)\n",
-                  AudioMemoryUsage(), AUDIO_MEM, AudioMemoryUsageMax());
-    t0 = millis();
+  static uint32_t tdbg=0;
+  if (millis() - tdbg > 150) {
+    float f_dbg = yin.read();            // safe: returns last computed value
+    float q_dbg = yin.probability();
+    Serial.printf("p=%.3f  env=%.3f  thr=%.3f  f=%.1fHz  q=%.2f\n", p, emaEnv, thresh, f_dbg, q_dbg);
+    tdbg = millis();
   }
-}
+ }
