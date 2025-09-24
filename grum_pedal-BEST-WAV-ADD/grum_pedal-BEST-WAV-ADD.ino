@@ -23,6 +23,12 @@ const char* FILE_HHCL  = "HHCL.WAV";
 const char* FILE_RIDE  = "RIDE.WAV";
 const char* FILE_CRASH = "CRASH.WAV";
 
+// ======Frequency Smoothing (NEW) =====
+const int FREQ_HISTORY_SIZE = 3; // Number of samples to average
+float freqHistory[FREQ_HISTORY_SIZE];
+int freqHistoryIndex = 0;
+bool freqHistoryFilled = false;
+
 // ====== AUDIO GRAPH ======
 // Input / analysis (kept from your sketch)
 AudioInputI2S             audioInput;      // Guitar input (Audio Shield)
@@ -105,6 +111,31 @@ bool canRetrigger(int drumIndex) {
   return false;
 }
 
+// ===== NEW FUNCTION: Smooth frequency readings =====
+float getSmoothedFrequency(float newFreq) {
+  // Add new frequency to history
+  freqHistory[freqHistoryIndex] = newFreq;
+  freqHistoryIndex = (freqHistoryIndex + 1) % FREQ_HISTORY_SIZE;
+
+  // Mark history as filled once we've gone through it
+  if (freqHistoryIndex == 0) {
+    freqHistoryFilled = true;
+  }
+
+  // Calculate average
+  float sum = 0;
+  int count = freqHistoryFilled ? FREQ_HISTORY_SIZE : freqHistoryIndex;
+
+  // Return raw value if we don't have enough samples yet
+  if (count == 0) return newFreq;
+
+  for (int i = 0; i < count; i++) {
+    sum += freqHistory[i];
+  }
+
+  return sum / count;
+}
+
 // ====== SETUP ======
 void setup() {
   Serial.begin(115200);
@@ -115,6 +146,11 @@ void setup() {
   Serial.println("====================================");
 
   AudioMemory(80); // more buffers for SD playback
+
+  // Initialize frequency history
+  for (int i = 0; i < FREQ_HISTORY_SIZE; i++) {
+    freqHistory[i] = 0;
+  }
 
   // Codec / input (same approach as yours)
   audioShield.enable();
@@ -171,7 +207,18 @@ void loop() {
 
     // Same gate you used
     if (probability > 0.6 && level > 0.02) {
-      triggerDrumForFrequency(freq);
+      // NEW: Use smoothed frequency instead of raw
+      float smoothedFreq = getSmoothedFrequency(freq);
+      triggerDrumForFrequency(smoothedFreq);
+
+      // Optional debug: show both raw and smooth frequency
+      if (false) { // Set to true to see the difference }
+        Serial.print("Raw: ");
+        Serial.print(freq, 1);
+        Serial.print(" Hz, Smoothed: ");
+        Serial.print(smoothedFreq, 1);
+        Serial.print( "Hz");
+      }
     }
   }
 }
