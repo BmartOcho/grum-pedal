@@ -50,7 +50,7 @@ AudioMixer4               drumBus;         // sum A+B to one bus
 
 // Final mix (kept from your sketch idea): guitar dry + drums + (extra slot if needed)
 AudioMixer4               mainMixer;       
-AudioOutputI2S            audioOutput;
+AudioOutputI2S            lineOutput;
 
 AudioControlSGTL5000      audioShield;
 
